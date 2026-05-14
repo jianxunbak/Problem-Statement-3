@@ -3,27 +3,33 @@
 This pyRevit extension provides tools under the **Data Agent** panel to automate model data auditing, visualization, and AI-driven data population in Autodesk Revit.
 
 ## 1. What the code does
-The extension currently consists of two powerful tools designed for model data management:
+The extension consists of three powerful tools designed for intelligent model data management:
 
-- **CheckData**: A comprehensive data auditing tool that evaluates the completeness of your model's parameters. It allows you to select a schedule, target a specific parameter, and filter by Category and Family. Once checked, it generates a beautiful, interactive HTML dashboard visualizing missing vs. filled data (using Chart.js) and outputs a detailed list of clickable Element IDs in pyRevit to help you quickly locate missing data in your model.
-- **FillData (AI Data Agent)**: An intelligent tool that uses the Anthropic Claude API to predict and fill in missing parameter values. Based on an element's Category, Family, and Type context, the AI will make an educated prediction for the missing parameter and automatically apply it back to the Revit elements in a single, fast transaction.
+- **Start (Autonomous Agent)**: The flagship tool that combines auditing and population. It first identifies missing parameter data within a selected scope and then automatically leverages the Anthropic Claude API to predict and fill those values in a single transaction. It concludes by generating an interactive HTML dashboard with AI-driven quality sanity checks.
+- **Check**: A dedicated auditing tool. It evaluates parameter completeness and generates a beautiful, interactive HTML dashboard visualizing missing vs. filled data. It also provides clickable Element IDs in the pyRevit output for quick manual navigation.
+- **Fill (AI Data Agent)**: A focused data population tool. It uses the Anthropic Claude API to intelligently predict missing parameter values based on Category, Family, and Type context, automatically applying them to the model.
 
 ## 2. How to use it
-**A typical workflow:**
-1. **Data Auditing (`CheckData`)**: 
-   - Click the **CheckData** button.
-   - When prompted for a command, type `check the data`.
-   - Select a Revit Schedule to define the scope of elements.
-   - Choose the target parameter you want to audit.
-   - Select the Categories and Families you want to analyze from the multi-select menu.
-   - The tool will run and automatically open a graphic HTML dashboard in your web browser, while also providing clickable Element IDs in the pyRevit output window.
-   
-2. **AI Data Population (`FillData`)**: 
-   - Once you know what data is missing, click the **FillData** button.
-   - When prompted for a command, type `start the data auditing`.
-   - Select the schedule and target parameter.
-   - The tool will securely prompt you for your Anthropic API Key (only needed once, saved in pyRevit settings).
-   - Claude will evaluate elements missing data and intelligently fill the parameter based on Revit category/family context.
+**Workflows:**
+
+### Option A: Fully Autonomous (`Start`)
+1. Click the **Start** button.
+2. Type `check the data` when prompted.
+3. Select a Revit Schedule to define the element scope.
+4. Choose the target parameter to audit and fill.
+5. Select specific Categories and Families to process.
+6. The agent will check the data, predict missing values via AI, update the model, and open a comprehensive HTML dashboard with BIM Manager insights.
+
+### Option B: Manual Audit & Review (`Check`)
+1. Click the **Check** button.
+2. Type `check the data` and follow the selection prompts.
+3. Use the generated HTML dashboard and pyRevit Element ID links to review model completeness without making changes.
+
+### Option C: AI Data Population (`Fill`)
+1. Click the **Fill** button.
+2. Type `start the data auditing` (this triggers the filling logic).
+3. Select the scope and parameter.
+4. The AI will securely use your API key to fill missing values and report its actions in the output window.
 
 ## 3. How to install it
 Since this is a pyRevit extension, you can install it by mapping its local path in pyRevit settings:
@@ -33,7 +39,8 @@ Since this is a pyRevit extension, you can install it by mapping its local path 
 4. Save settings and reload pyRevit (**pyRevit** tab -> **Reload**).
 5. The **AgentD** tab and **Data Agent** panel should now appear in the Revit ribbon.
 
-## 4. Any other guides to help users
-- **Anthropic API Key**: The `FillData` AI Data Agent requires an active Anthropic API Key to function. Ensure your account has sufficient credits or access to `claude-haiku-4-5-20251001`. The key is securely saved locally via pyRevit `user_config`.
-- **Revit API Transactions**: The `FillData` tool uses Revit API transactions safely. If an error occurs during AI data population, changes are rolled back to prevent model corruption.
-- **Dashboard Output**: The `CheckData` tool generates its dashboard as a temporary HTML file and opens it in your default web browser. For security and performance, this is generated entirely locally and no model data is sent to external servers during the check phase.
+## 4. Configuration & Security
+- **Anthropic API Key**: The `Start` and `Fill` tools require an active Anthropic API Key. You will be prompted to enter it once; it is then securely saved locally via pyRevit `user_config`.
+- **AI Model**: Currently optimized for `claude-haiku-4-5-20251001` for a balance of speed and intelligence.
+- **Transactions**: All model updates are handled within Revit API transactions. If an error occurs, changes are rolled back to maintain model integrity.
+- **Privacy**: No model geometry or sensitive data is sent to external servers. Only the Category, Family, and Type names of elements missing data are sent to the Anthropic API for value prediction.
