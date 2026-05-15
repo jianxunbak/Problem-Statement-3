@@ -164,6 +164,70 @@ def _write_json(ctx, payload, status_code=200):
             pass
 
 
+class _SSEResponder(object):
+    """Streams Server-Sent Events back to Agent A while a long fill/pipeline
+    job runs.
+
+    Agent A's external_agents._consume_stream looks for `data: <json>` lines
+    where the json has either {"type":"status","text":...} (progress nudges)
+    or {"type":"result","payload":...} (final response). We write the SSE
+    headers eagerly so the client knows to switch to streaming mode, then
+    flush after every event so Agent A's spinner updates per row instead of
+    going dark for minutes.
+    """
+
+    def __init__(self, ctx):
+        self._ctx = ctx
+        resp = ctx.Response
+        resp.StatusCode = 200
+        resp.ContentType = "text/event-stream"
+        # No ContentLength64 — chunked stream of unknown length.
+        try:
+            resp.SendChunked = True
+        except Exception:
+            pass
+        try:
+            resp.Headers.Add("Cache-Control", "no-cache")
+        except Exception:
+            pass
+        self._stream = resp.OutputStream
+        self._closed = False
+
+    def status(self, text):
+        self._write_event({"type": "status", "text": text})
+
+    def result(self, payload):
+        self._write_event({"type": "result", "payload": payload})
+
+    def _write_event(self, obj):
+        if self._closed:
+            return
+        try:
+            line = "data: " + json.dumps(obj) + "\n\n"
+            data = Encoding.UTF8.GetBytes(line)
+            self._stream.Write(data, 0, data.Length)
+            try:
+                self._stream.Flush()
+            except Exception:
+                pass
+        except Exception:
+            # Client disconnected mid-stream — stop writing.
+            self._closed = True
+
+    def close(self):
+        if self._closed:
+            return
+        self._closed = True
+        try:
+            self._stream.Close()
+        except Exception:
+            pass
+        try:
+            self._ctx.Response.Close()
+        except Exception:
+            pass
+
+
 def _read_request_body(ctx):
     req = ctx.Request
     if not req.HasEntityBody:
@@ -219,16 +283,119 @@ def _handle_request(ctx):
         return
 
     if action == "audit_data":
+        # audit_data is fast and doesn't call Claude — single main-thread hop is fine.
         result = run_on_main_thread(agentd_headless.audit_data,
                                     (schedule_name, parameter_name))
-    elif action == "fill_data":
-        result = run_on_main_thread(agentd_headless.fill_data,
-                                    (schedule_name, parameter_name, api_key))
-    else:  # start_pipeline
-        result = run_on_main_thread(agentd_headless.start_pipeline,
-                                    (schedule_name, parameter_name, api_key))
+        _write_json(ctx, result)
+        return
 
-    _write_json(ctx, result)
+    # fill_data / start_pipeline: stream SSE so the main thread is free during
+    # the slow per-row Claude calls. Without this, Agent A's chat window and
+    # Revit's UI both freeze for the full duration of the run.
+    resolved_key = agentd_headless._resolve_api_key(api_key)
+    if not resolved_key:
+        _write_json(ctx, {"status": "error", "reason": "api_key_missing",
+                          "message": "No Anthropic API key supplied via request or user_config.ini"})
+        return
+
+    sse = _SSEResponder(ctx)
+    try:
+        result = _run_fill_streaming(sse, schedule_name, parameter_name,
+                                     resolved_key, with_insights=(action == "start_pipeline"))
+        sse.result(result)
+    finally:
+        sse.close()
+
+
+def _run_fill_streaming(sse, schedule_name, parameter_name, api_key, with_insights):
+    """Orchestrate the three-phase fill on the bridge's worker thread.
+
+    Only fill_snapshot / fill_commit / pipeline_post_audit hop to the main
+    thread (each runs in milliseconds for normal schedules). The per-row
+    Claude calls run right here on the worker thread, so Revit's UI stays
+    responsive throughout.
+    """
+    sse.status("Reading schedule…")
+    snap = run_on_main_thread(agentd_headless.fill_snapshot,
+                              (schedule_name, parameter_name))
+    if not snap or snap.get("status") != "ready":
+        return snap or {"status": "error", "reason": "internal_error",
+                        "message": "fill_snapshot returned no result."}
+
+    rows = snap["rows"]
+    target_param_id = snap["target_param_id"]
+    total_elements = snap["total_elements"]
+    initially_missing = len(rows)
+
+    if not rows:
+        # Nothing to fill — emit a success result so Agent A doesn't show "failed".
+        return {
+            "status": "success",
+            "target_parameter": parameter_name,
+            "statistics": {
+                "total_elements": total_elements,
+                "initially_missing": 0,
+                "ai_filled_successfully": 0,
+                "errors": 0,
+            }
+        }
+
+    sse.status("Predicting {} missing value{}…".format(
+        initially_missing, "" if initially_missing == 1 else "s"))
+
+    updates = []
+    errors = 0
+    for idx, row in enumerate(rows, start=1):
+        sse.status("Predicting row {}/{} ({})…".format(idx, initially_missing, row["category"]))
+        out = agentd_headless.fill_predict_one(api_key, parameter_name, row)
+        if "value" in out:
+            updates.append(out)
+        else:
+            errors += 1
+
+    sse.status("Writing {} value{} to Revit…".format(
+        len(updates), "" if len(updates) == 1 else "s"))
+    commit = run_on_main_thread(agentd_headless.fill_commit,
+                                (parameter_name, target_param_id, updates))
+    if commit.get("status") == "error":
+        return commit
+    filled_ok = commit.get("filled_ok", 0)
+
+    statistics = {
+        "total_elements": total_elements,
+        "initially_missing": initially_missing,
+        "ai_filled_successfully": filled_ok,
+        "errors": errors,
+    }
+
+    if not with_insights:
+        return {
+            "status": "success",
+            "target_parameter": parameter_name,
+            "statistics": statistics,
+        }
+
+    sse.status("Running AI sanity check…")
+    post = run_on_main_thread(agentd_headless.pipeline_post_audit,
+                              (schedule_name, parameter_name))
+    if not post or post.get("status") != "ready":
+        # Surface a soft-fail: the fill succeeded, just no insights.
+        return {
+            "status": "success",
+            "target_parameter": parameter_name,
+            "statistics": statistics,
+            "ai_sanity_check_insights": ["AI sanity check unavailable: post-fill audit failed."],
+        }
+    system_prompt, user_prompt = agentd_headless.pipeline_build_insights_prompt(
+        parameter_name, post["audit"])
+    insights = agentd_headless.pipeline_call_insights(api_key, system_prompt, user_prompt)
+
+    return {
+        "status": "success",
+        "target_parameter": parameter_name,
+        "statistics": statistics,
+        "ai_sanity_check_insights": insights,
+    }
 
 
 def _accept_loop(listener):

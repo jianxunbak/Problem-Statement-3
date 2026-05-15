@@ -310,6 +310,158 @@ def audit_data(doc, schedule_name, parameter_name):
     }
 
 
+# ---------------------------------------------------------------------------
+# Split-phase fill API
+#
+# The monolithic fill_data() below blocks Revit's main thread for the full
+# duration of the run because each per-row Claude call (~1-2s) happens inside
+# the main-thread loop. For schedules with dozens of missing rows this freezes
+# both Revit and Agent A's chat window.
+#
+# These three helpers split the work so only the fast Revit-API parts run on
+# the main thread; the slow Claude HTTP calls run on the bridge's worker
+# thread, where they don't block the UI:
+#
+#   fill_snapshot(doc, ...)        — main thread, fast: collect rows to fill
+#   fill_predict_one(api_key, row) — worker thread, slow: one Claude call
+#   fill_commit(doc, updates, ...) — main thread, fast: one Transaction
+#
+# The bridge in script.py orchestrates them; agentd_headless.fill_data is kept
+# below for any direct caller that still wants the blocking single-shot API.
+# ---------------------------------------------------------------------------
+
+
+def fill_snapshot(doc, schedule_name, parameter_name):
+    """Main-thread phase 1: resolve schedule/param and list rows needing fill.
+
+    Returns one of:
+        {"status": "error", ...}
+        {"status": "ready", "target_param_id": <ElementId>,
+         "rows": [{"el_id": <ElementId>, "category": str, "family": str,
+                   "type": str}, ...],
+         "total_elements": int, "read_only_seen": bool}
+
+    `target_param_id` is opaque to the worker thread — it's threaded back into
+    fill_commit() unchanged.
+    """
+    if doc is None:
+        return {"status": "error", "reason": "no_active_document",
+                "message": "No active Revit document."}
+
+    target_schedule = _find_schedule(doc, schedule_name)
+    if target_schedule is None:
+        return {"status": "error", "reason": "schedule_not_found",
+                "schedule": schedule_name,
+                "message": "ViewSchedule '{}' not found.".format(schedule_name)}
+
+    target_param_id = _find_param_id_on_schedule(target_schedule, parameter_name)
+    if target_param_id is None:
+        return {"status": "error", "reason": "parameter_not_found",
+                "parameter": parameter_name,
+                "message": "Parameter '{}' is not a field on schedule '{}'.".format(parameter_name, schedule_name)}
+
+    elements = FilteredElementCollector(doc, target_schedule.Id).ToElements()
+    total_elements = len(elements)
+
+    rows = []
+    param_found_on_any = False
+    read_only_seen = False
+
+    for el in elements:
+        param = _get_param(doc, el, target_param_id)
+        if not param:
+            continue
+        param_found_on_any = True
+
+        if param.IsReadOnly:
+            read_only_seen = True
+            continue
+
+        if param.StorageType != StorageType.String:
+            continue
+
+        current_val = param.AsString()
+        if current_val and current_val.strip() != "":
+            continue
+
+        category_name, family_name, type_name = _gather_context(doc, el)
+        rows.append({
+            "el_id": el.Id,
+            "category": category_name,
+            "family": family_name,
+            "type": type_name,
+        })
+
+    if not param_found_on_any:
+        return {"status": "error", "reason": "parameter_not_found",
+                "parameter": parameter_name,
+                "message": "Parameter '{}' is not present on any element in schedule '{}'.".format(parameter_name, schedule_name)}
+
+    if not rows and read_only_seen and total_elements > 0:
+        return {"status": "error", "reason": "parameter_read_only",
+                "parameter": parameter_name,
+                "message": "Parameter '{}' is read-only on all matching elements.".format(parameter_name)}
+
+    return {
+        "status": "ready",
+        "target_param_id": target_param_id,
+        "rows": rows,
+        "total_elements": total_elements,
+        "read_only_seen": read_only_seen,
+    }
+
+
+def fill_predict_one(api_key, parameter_name, row):
+    """Worker-thread phase 2: one Claude call. NO Revit API access here.
+
+    `row` is a dict from fill_snapshot()'s rows list. Returns either:
+        {"el_id": ..., "value": "<predicted>"} on success, or
+        {"el_id": ..., "error": "<reason>"} on failure / UNKNOWN.
+    """
+    predicted = _call_claude_predict(api_key, parameter_name,
+                                     row["category"], row["family"], row["type"])
+    if predicted and not predicted.startswith("ERROR") and predicted != "UNKNOWN":
+        return {"el_id": row["el_id"], "value": predicted}
+    return {"el_id": row["el_id"], "error": predicted or "empty_response"}
+
+
+def fill_commit(doc, parameter_name, target_param_id, updates):
+    """Main-thread phase 3: write all predicted values in one Transaction.
+
+    `updates` is a list of {"el_id", "value"} dicts (errors filtered out by
+    the caller). Returns {"filled_ok": int} on success or {"status": "error", ...}.
+    """
+    if doc is None:
+        return {"status": "error", "reason": "no_active_document",
+                "message": "No active Revit document."}
+
+    if not updates:
+        return {"filled_ok": 0}
+
+    t = Transaction(doc, "Agent D - Fill: " + parameter_name)
+    t.Start()
+    filled_ok = 0
+    try:
+        for upd in updates:
+            el = doc.GetElement(upd["el_id"])
+            if el is None:
+                continue
+            param = _get_param(doc, el, target_param_id)
+            if param and not param.IsReadOnly:
+                param.Set(upd["value"])
+                filled_ok += 1
+        t.Commit()
+    except Exception as e:
+        try:
+            t.RollBack()
+        except Exception:
+            pass
+        return {"status": "error", "reason": "transaction_failed",
+                "message": "Transaction failed: " + str(e)}
+
+    return {"filled_ok": filled_ok}
+
+
 def fill_data(doc, schedule_name, parameter_name, api_key):
     if doc is None:
         return {"status": "error", "reason": "no_active_document",
@@ -408,6 +560,94 @@ def fill_data(doc, schedule_name, parameter_name, api_key):
             "errors": errors,
         }
     }
+
+
+def pipeline_post_audit(doc, schedule_name, parameter_name):
+    """Main-thread helper for the split-phase start_pipeline.
+
+    After fill_commit runs, the bridge needs the post-fill audit (so the AI
+    sanity-check prompt sees the current state). Returns the audit dict on
+    success, or {"status": "error", ...}. The sanity-check Claude call itself
+    runs on the worker thread — see pipeline_build_insights_prompt below.
+    """
+    if doc is None:
+        return {"status": "error", "reason": "no_active_document",
+                "message": "No active Revit document."}
+    target_schedule = _find_schedule(doc, schedule_name)
+    if target_schedule is None:
+        return {"status": "error", "reason": "schedule_not_found",
+                "schedule": schedule_name,
+                "message": "ViewSchedule '{}' not found.".format(schedule_name)}
+    target_param_id = _find_param_id_on_schedule(target_schedule, parameter_name)
+    if target_param_id is None:
+        return {"status": "error", "reason": "parameter_not_found",
+                "parameter": parameter_name,
+                "message": "Parameter '{}' is not a field on schedule '{}'."
+                           .format(parameter_name, schedule_name)}
+    audit = _build_audit_report(doc, target_schedule, target_param_id)
+    return {"status": "ready", "audit": audit}
+
+
+def pipeline_build_insights_prompt(parameter_name, audit):
+    """Pure function (no Revit, no doc) — produces the (system, user) prompts
+    consumed by _call_claude_insights. Lives here so the bridge stays a thin
+    orchestrator."""
+    system_prompt = (
+        "You are an expert BIM Manager AI. Analyze Revit data audit results and "
+        "produce a SHORT plain-text list of insights. Output ONLY a JSON array of "
+        "strings, e.g. [\"Task 1: ...\", \"Task 2: ...\"]. No prose outside the array."
+    )
+
+    cat_lines = []
+    for cat, fams in audit["report"].items():
+        m = 0
+        f = 0
+        for fam, types in fams.items():
+            for typ, bucket in types.items():
+                m += bucket["missing"]
+                f += bucket["filled"]
+        cat_lines.append("- {}: {} missing, {} filled".format(cat, m, f))
+
+    unique_lines = []
+    for cat, vals in audit["cat_unique_filled"].items():
+        if vals:
+            safe_vals = [v for v in vals if v]
+            unique_lines.append("- {}: {}".format(cat, list(safe_vals)))
+
+    user_prompt = (
+        "Audit Results for Parameter: '{}'\n\n"
+        "MISSING DATA COUNTS:\n{}\n\n"
+        "UNIQUE FILLED VALUES SAMPLED:\n{}\n\n"
+        "Task 1 (Data Quality Sanity Check): Identify any filled values that look like "
+        "errors, typos, or generic placeholders (e.g. 'TBD', 'N/A'). If none, say data "
+        "quality looks standard.\n"
+        "Task 2 (Next Steps): Recommend the next 1-2 actions, starting with the category "
+        "with the most missing data.\n"
+        "Respond as a JSON array of strings only."
+    ).format(parameter_name, "\n".join(cat_lines), "\n".join(unique_lines))
+
+    return system_prompt, user_prompt
+
+
+def pipeline_call_insights(api_key, system_prompt, user_prompt):
+    """Worker-thread wrapper around _call_claude_insights. Returns a parsed
+    list[str] of insights — never raises."""
+    insights = []
+    try:
+        raw = _call_claude_insights(api_key, system_prompt, user_prompt)
+        if raw and not raw.startswith("ERROR"):
+            cleaned = raw.replace("```json", "").replace("```", "").strip()
+            try:
+                parsed = json.loads(cleaned)
+                if isinstance(parsed, list):
+                    insights = [str(x) for x in parsed]
+                else:
+                    insights = [cleaned]
+            except Exception:
+                insights = [line.strip() for line in cleaned.split("\n") if line.strip()]
+    except Exception as e:
+        insights = ["AI sanity check unavailable: " + str(e)]
+    return insights
 
 
 def start_pipeline(doc, schedule_name, parameter_name, api_key):
