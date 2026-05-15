@@ -88,7 +88,17 @@ def call_claude_insights(api_key, system_prompt, user_prompt):
         import traceback
         return "<div class='ai-card'><h3>⚠️ AI Error</h3><pre>" + traceback.format_exc() + "</pre></div>"
 
-def predict_missing_value(api_key, target_param_name, category, family, type_name):
+def predict_missing_values_batch(api_key, target_param_name, unique_contexts):
+    """Predict values for multiple unique element types in a single API call.
+    
+    Args:
+        api_key: Anthropic API key
+        target_param_name: Name of the parameter to predict
+        unique_contexts: List of (category, family, type_name) tuples
+    
+    Returns:
+        Dict mapping index (int) to predicted value (str), or {"error": msg} on failure.
+    """
     ServicePointManager.SecurityProtocol = SecurityProtocolType.Tls12
     url = "https://api.anthropic.com/v1/messages"
     request = WebRequest.Create(url)
@@ -99,22 +109,26 @@ def predict_missing_value(api_key, target_param_name, category, family, type_nam
     
     system_prompt = (
         "You are an expert BIM data agent. Your task is to predict the most likely "
-        "value for a missing Revit parameter based on the element's Category, Family, and Type. "
-        "Respond ONLY with the predicted value. Do not add any conversational text, formatting, or punctuation. "
+        "values for missing Revit parameters based on each element's Category, Family, and Type. "
+        "You will receive a numbered list of elements. "
+        "Respond ONLY with a valid JSON object mapping each number to its predicted value. "
+        'Example: {"0": "Concrete", "1": "Steel", "2": "Timber"}\n'
+        "Do not add any conversational text, formatting, or markdown code blocks. "
         "Always make your best professional guess for a concise value (e.g., a descriptive name or standard code). "
-        "NEVER respond with 'UNKNOWN' or say you cannot do it."
+        "NEVER use 'UNKNOWN' or say you cannot do it."
     )
     
-    user_prompt = (
-        "Predict the value for the parameter '{}'.\n"
-        "Category: {}\n"
-        "Family: {}\n"
-        "Type: {}".format(target_param_name, category, family, type_name)
-    )
+    user_prompt = "Predict the value for the parameter '{}' for each element below:\n\n".format(target_param_name)
+    for i, (cat, fam, typ) in enumerate(unique_contexts):
+        user_prompt += "{}. Category: {} | Family: {} | Type: {}\n".format(i, cat, fam, typ)
+    
+    # Scale max_tokens to the number of predictions needed, with a reasonable cap
+    max_tokens = max(100, len(unique_contexts) * 25)
+    max_tokens = min(max_tokens, 4096)
     
     data = {
         "model": "claude-haiku-4-5-20251001",
-        "max_tokens": 50,
+        "max_tokens": max_tokens,
         "system": system_prompt,
         "messages": [{"role": "user", "content": user_prompt}],
         "temperature": 0.0
@@ -134,9 +148,13 @@ def predict_missing_value(api_key, target_param_name, category, family, type_nam
         reader.Close()
         response.Close()
         result = json.loads(response_text)
-        return result['content'][0]['text'].strip()
+        text = result['content'][0]['text'].strip()
+        # Clean up potential markdown code blocks from the response
+        text = text.replace("```json", "").replace("```", "").strip()
+        predictions = json.loads(text)
+        return {int(k): v for k, v in predictions.items()}
     except Exception as e:
-        return "ERROR: " + str(e)
+        return {"error": str(e)}
 
 def main():
     doc = __revit__.ActiveUIDocument.Document
@@ -346,16 +364,52 @@ def main():
                 for typ in report[cat][fam]:
                     for el_id in report[cat][fam][typ]["missing"]:
                         missing_elements.append((el_id, cat, fam, typ))
-                        
-        with forms.ProgressBar(title="Agent is predicting missing data...", step=len(missing_elements)) as pb:
-            for idx, (el_id, cat, fam, typ) in enumerate(missing_elements):
-                predicted_value = predict_missing_value(api_key, target_param_name, cat, fam, typ)
-                if predicted_value and not predicted_value.startswith("ERROR") and predicted_value != "UNKNOWN":
-                    updates_to_make.append((el_id, predicted_value, cat, fam, typ))
+        
+        # Deduplicate: group elements by unique (category, family, type)
+        # so identical element types share one prediction instead of N calls
+        unique_contexts = {}
+        for el_id, cat, fam, typ in missing_elements:
+            key = (cat, fam, typ)
+            if key not in unique_contexts:
+                unique_contexts[key] = []
+            unique_contexts[key].append(el_id)
+        
+        unique_keys = list(unique_contexts.keys())
+        BATCH_SIZE = 50
+        total_batches = (len(unique_keys) + BATCH_SIZE - 1) // BATCH_SIZE
+        predictions_map = {}  # (cat, fam, typ) -> predicted_value
+        
+        output.print_md("🔄 **Batching {} unique element types into {} API call(s)** (instead of {} individual calls)".format(
+            len(unique_keys), total_batches, len(missing_elements)))
+        
+        with forms.ProgressBar(title="Agent is predicting missing data (batched)...", step=total_batches) as pb:
+            for batch_idx in range(0, len(unique_keys), BATCH_SIZE):
+                batch = unique_keys[batch_idx:batch_idx + BATCH_SIZE]
+                batch_predictions = predict_missing_values_batch(api_key, target_param_name, batch)
+                
+                if isinstance(batch_predictions, dict) and "error" in batch_predictions:
+                    output.print_md("⚠️ **Batch API error:** {}".format(batch_predictions["error"]))
+                    for key in batch:
+                        for el_id in unique_contexts[key]:
+                            errors += 1
                 else:
-                    output.print_md("⚠️ **Skipped Element `{}`** - Agent uncertain (Returned: `{}`)".format(el_id, predicted_value))
-                    errors += 1
-                pb.update_progress(idx + 1, len(missing_elements))
+                    for i, key in enumerate(batch):
+                        predicted_value = batch_predictions.get(i, "")
+                        if predicted_value and predicted_value != "UNKNOWN":
+                            predictions_map[key] = predicted_value
+                        else:
+                            for el_id in unique_contexts[key]:
+                                output.print_md("⚠️ **Skipped Element `{}`** - Agent uncertain".format(el_id))
+                                errors += 1
+                
+                current_batch = (batch_idx // BATCH_SIZE) + 1
+                pb.update_progress(current_batch, total_batches)
+        
+        # Build the final updates list by mapping predictions back to all elements
+        for el_id, cat, fam, typ in missing_elements:
+            key = (cat, fam, typ)
+            if key in predictions_map:
+                updates_to_make.append((el_id, predictions_map[key], cat, fam, typ))
                 
         if updates_to_make:
             t = Transaction(doc, "Agent Data Auto-Fill: " + target_param_name)
