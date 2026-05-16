@@ -80,30 +80,46 @@ class BridgeEventHandler(IExternalEventHandler):
 
     def Execute(self, uiapp):
         try:
-            doc = uiapp.ActiveUIDocument.Document if uiapp.ActiveUIDocument else None
+            uidoc = uiapp.ActiveUIDocument
+            doc = uidoc.Document if uidoc else None
         except Exception:
+            uidoc = None
             doc = None
 
-        for item in self._queue.drain():
-            fn, args, result_holder, done_event = item
-            try:
-                if doc is None:
+        # Publish the UIDocument so headless ops that need UI access (e.g.
+        # create_audit_schedule's auto-open) can pick it up. Cleared after
+        # the dispatch loop so stale references don't leak.
+        try:
+            agentd_headless.set_active_uidoc(uidoc)
+        except Exception:
+            pass
+
+        try:
+            for item in self._queue.drain():
+                fn, args, result_holder, done_event = item
+                try:
+                    if doc is None:
+                        result_holder["data"] = {
+                            "status": "error",
+                            "reason": "no_active_document",
+                            "message": "No active Revit document."
+                        }
+                    else:
+                        result_holder["data"] = fn(doc, *args)
+                except Exception as e:
                     result_holder["data"] = {
                         "status": "error",
-                        "reason": "no_active_document",
-                        "message": "No active Revit document."
+                        "reason": "internal_error",
+                        "message": str(e),
+                        "trace": traceback.format_exc(),
                     }
-                else:
-                    result_holder["data"] = fn(doc, *args)
-            except Exception as e:
-                result_holder["data"] = {
-                    "status": "error",
-                    "reason": "internal_error",
-                    "message": str(e),
-                    "trace": traceback.format_exc(),
-                }
+                try:
+                    done_event.Set()
+                except Exception:
+                    pass
+        finally:
             try:
-                done_event.Set()
+                agentd_headless.set_active_uidoc(None)
             except Exception:
                 pass
 
@@ -386,6 +402,20 @@ def _run_fill_streaming(sse, category_name, parameter_name, api_key, with_insigh
                 parameter_name, post_audit)
             insights = agentd_headless.pipeline_call_insights(api_key, system_prompt, user_prompt)
 
+    # Create the "Data Agent Audit - <param>" ViewSchedule so the user sees
+    # the filled values back in Revit. Mirrors Start.pushbutton's final step.
+    # Best-effort: a schedule-creation failure must NOT block the dashboard or
+    # the success response we send back to Agent A.
+    schedule_name = None
+    try:
+        sse.status("Creating audit schedule…")
+        sched_result = run_on_main_thread(agentd_headless.create_audit_schedule,
+                                          (parameter_name,))
+        if sched_result and sched_result.get("status") == "ready":
+            schedule_name = sched_result.get("schedule_name")
+    except Exception:
+        schedule_name = None
+
     # Open the HTML dashboard in the user's default browser. Mirrors what the
     # standalone Start.pushbutton does at the end of its run. Wrapped in
     # try/except — a browser-launch failure must NOT break the response we
@@ -409,6 +439,8 @@ def _run_fill_streaming(sse, category_name, parameter_name, api_key, with_insigh
         result["ai_sanity_check_insights"] = insights
     if dashboard_path:
         result["dashboard_path"] = dashboard_path
+    if schedule_name:
+        result["schedule_name"] = schedule_name
     return result
 
 

@@ -21,13 +21,32 @@ clr.AddReference('RevitAPI')
 from Autodesk.Revit.DB import (
     FilteredElementCollector,
     Transaction,
-    StorageType
+    StorageType,
+    ViewSchedule,
+    ElementId
 )
 
 import System
 clr.AddReference('System')
 from System.Net import WebRequest, ServicePointManager, SecurityProtocolType
 from System.IO import StreamReader
+
+
+# ---------------------------------------------------------------------------
+# UIDocument handle
+#
+# Most headless ops only need `doc`, but create_audit_schedule wants to open
+# the newly-created schedule via uidoc.ActiveView — and uidoc is only reachable
+# inside the bridge's ExternalEvent.Execute(uiapp) callback. The bridge calls
+# set_active_uidoc(uidoc) before dispatching each job, and clears it after.
+# ---------------------------------------------------------------------------
+
+_ACTIVE_UIDOC = None
+
+
+def set_active_uidoc(uidoc):
+    global _ACTIVE_UIDOC
+    _ACTIVE_UIDOC = uidoc
 
 
 # ---------------------------------------------------------------------------
@@ -528,6 +547,129 @@ def fill_commit(doc, parameter_name, target_param_id, updates):
                 "message": "Transaction failed: " + str(e)}
 
     return {"filled_ok": filled_ok}
+
+
+def create_audit_schedule(doc, parameter_name):
+    """Main-thread: create a multi-category audit ViewSchedule for the given
+    parameter, mirroring the Start.pushbutton behavior. Idempotent — replaces
+    any existing schedule with the same name. Auto-opens the schedule view via
+    the active UIDocument (set by the bridge before dispatching).
+
+    Returns {"status": "ready", "schedule_name": "...", "opened": bool}
+    or {"status": "error", ...}. Never raises.
+    """
+    if doc is None:
+        return {"status": "error", "reason": "no_active_document",
+                "message": "No active Revit document."}
+
+    schedule_name = "Data Agent Audit - {}".format(parameter_name)
+
+    # Replace any existing schedule with the same name.
+    try:
+        existing = FilteredElementCollector(doc).OfClass(ViewSchedule).ToElements()
+        for v in existing:
+            try:
+                if v.Name == schedule_name:
+                    t_del = Transaction(doc, "Delete Old Audit Schedule")
+                    t_del.Start()
+                    doc.Delete(v.Id)
+                    t_del.Commit()
+                    break
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+    # Transaction 1: create the (multi-category) schedule.
+    t = Transaction(doc, "Create Data Agent Audit Schedule")
+    t.Start()
+    try:
+        schedule = ViewSchedule.CreateSchedule(doc, ElementId.InvalidElementId)
+        schedule.Name = schedule_name
+        t.Commit()
+    except Exception as e:
+        try:
+            t.RollBack()
+        except Exception:
+            pass
+        return {"status": "error", "reason": "schedule_create_failed",
+                "message": "Could not create schedule: " + str(e)}
+
+    # Transaction 2: add the standard fields + the target parameter.
+    definition = schedule.Definition
+    try:
+        schedulable_fields = definition.GetSchedulableFields()
+    except Exception as e:
+        return {"status": "error", "reason": "schedule_fields_unavailable",
+                "schedule_name": schedule_name,
+                "message": "Could not enumerate schedulable fields: " + str(e)}
+
+    all_fields = []
+    for i in range(schedulable_fields.Count):
+        sf = schedulable_fields[i]
+        try:
+            name = sf.GetName(doc)
+        except Exception:
+            name = None
+        if name:
+            all_fields.append((name, sf))
+
+    desired_fields = ["Category", "Family", "Type", "Count", "Description"]
+    by_name = {}
+    for n, sf in all_fields:
+        if n not in by_name:
+            by_name[n] = sf
+
+    t2 = Transaction(doc, "Add Fields to Audit Schedule")
+    t2.Start()
+    fields_added = []
+    try:
+        for desired in desired_fields:
+            sf = by_name.get(desired)
+            if sf is None:
+                continue
+            try:
+                definition.AddField(sf)
+                fields_added.append(desired)
+            except Exception:
+                pass
+
+        if parameter_name and parameter_name not in set(desired_fields):
+            sf = by_name.get(parameter_name)
+            if sf is not None:
+                try:
+                    definition.AddField(sf)
+                    fields_added.append(parameter_name)
+                except Exception:
+                    pass
+
+        t2.Commit()
+    except Exception as e:
+        try:
+            t2.RollBack()
+        except Exception:
+            pass
+        return {"status": "error", "reason": "schedule_fields_failed",
+                "schedule_name": schedule_name,
+                "message": "Could not add fields: " + str(e)}
+
+    # Auto-open the schedule view — mirrors Start.pushbutton's `uidoc.ActiveView = schedule`.
+    # Best-effort: a failure here must not turn the whole call into an error.
+    opened = False
+    uidoc = _ACTIVE_UIDOC
+    if uidoc is not None:
+        try:
+            uidoc.ActiveView = schedule
+            opened = True
+        except Exception:
+            opened = False
+
+    return {
+        "status": "ready",
+        "schedule_name": schedule_name,
+        "fields_added": fields_added,
+        "opened": opened,
+    }
 
 
 def fill_data(doc, category_name, parameter_name, api_key):
