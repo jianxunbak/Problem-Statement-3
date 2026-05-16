@@ -134,9 +134,9 @@ def run_on_main_thread(fn, args, timeout_ms=600000):
 # ---------------------------------------------------------------------------
 
 _ACTIONS = {
-    "audit_data": ("audit", ["schedule_name", "parameter_name"]),
-    "fill_data": ("fill", ["schedule_name", "parameter_name", "api_key"]),
-    "start_pipeline": ("start", ["schedule_name", "parameter_name", "api_key"]),
+    "audit_data": ("audit", ["category_name", "parameter_name"]),
+    "fill_data": ("fill", ["category_name", "parameter_name", "api_key"]),
+    "start_pipeline": ("start", ["category_name", "parameter_name", "api_key"]),
 }
 
 
@@ -273,19 +273,19 @@ def _handle_request(ctx):
                           "message": "Unknown action: " + str(action)})
         return
 
-    schedule_name = payload.get("schedule_name")
+    category_name = payload.get("category_name")
     parameter_name = payload.get("parameter_name")
     api_key = payload.get("api_key") or ""
 
-    if not schedule_name or not parameter_name:
+    if not category_name or not parameter_name:
         _write_json(ctx, {"status": "error", "reason": "invalid_json",
-                          "message": "Missing required field: schedule_name and parameter_name are required."})
+                          "message": "Missing required field: category_name and parameter_name are required."})
         return
 
     if action == "audit_data":
         # audit_data is fast and doesn't call Claude — single main-thread hop is fine.
         result = run_on_main_thread(agentd_headless.audit_data,
-                                    (schedule_name, parameter_name))
+                                    (category_name, parameter_name))
         _write_json(ctx, result)
         return
 
@@ -300,14 +300,14 @@ def _handle_request(ctx):
 
     sse = _SSEResponder(ctx)
     try:
-        result = _run_fill_streaming(sse, schedule_name, parameter_name,
+        result = _run_fill_streaming(sse, category_name, parameter_name,
                                      resolved_key, with_insights=(action == "start_pipeline"))
         sse.result(result)
     finally:
         sse.close()
 
 
-def _run_fill_streaming(sse, schedule_name, parameter_name, api_key, with_insights):
+def _run_fill_streaming(sse, category_name, parameter_name, api_key, with_insights):
     """Orchestrate the three-phase fill on the bridge's worker thread.
 
     Only fill_snapshot / fill_commit / pipeline_post_audit hop to the main
@@ -315,9 +315,9 @@ def _run_fill_streaming(sse, schedule_name, parameter_name, api_key, with_insigh
     Claude calls run right here on the worker thread, so Revit's UI stays
     responsive throughout.
     """
-    sse.status("Reading schedule…")
+    sse.status("Reading elements…")
     snap = run_on_main_thread(agentd_headless.fill_snapshot,
-                              (schedule_name, parameter_name))
+                              (category_name, parameter_name))
     if not snap or snap.get("status") != "ready":
         return snap or {"status": "error", "reason": "internal_error",
                         "message": "fill_snapshot returned no result."}
@@ -373,7 +373,7 @@ def _run_fill_streaming(sse, schedule_name, parameter_name, api_key, with_insigh
     # opens at the end of either flow.
     sse.status("Auditing post-fill state…")
     post = run_on_main_thread(agentd_headless.pipeline_post_audit,
-                              (schedule_name, parameter_name))
+                              (category_name, parameter_name))
     post_audit = post.get("audit") if (post and post.get("status") == "ready") else None
 
     insights = []

@@ -20,7 +20,6 @@ except NameError:  # pragma: no cover — only fires under a Py3 linter
 clr.AddReference('RevitAPI')
 from Autodesk.Revit.DB import (
     FilteredElementCollector,
-    ViewSchedule,
     Transaction,
     StorageType
 )
@@ -142,28 +141,67 @@ def _resolve_api_key(api_key):
 
 
 # ---------------------------------------------------------------------------
-# Schedule / parameter resolution
+# Category / parameter resolution
+#
+# The bridge accepts `category_name` as either a string ("Walls") or a list
+# (["Walls", "Doors"]) — mirrors the main Start.pushbutton flow which collects
+# elements by category, not by schedule.
 # ---------------------------------------------------------------------------
 
-def _find_schedule(doc, schedule_name):
-    schedules = FilteredElementCollector(doc).OfClass(ViewSchedule).ToElements()
-    for s in schedules:
+def _normalize_category_names(category_name):
+    """Accept str or list[str]; return a list of trimmed non-empty names."""
+    if category_name is None:
+        return []
+    if isinstance(category_name, (list, tuple)):
+        return [unicode(n).strip() for n in category_name if n and unicode(n).strip()]
+    return [unicode(category_name).strip()] if unicode(category_name).strip() else []
+
+
+def _find_categories(doc, names):
+    """Resolve names to Revit Category objects (case-insensitive).
+    Returns (matched_categories, unresolved_names)."""
+    by_lower = {}
+    for cat in doc.Settings.Categories:
         try:
-            if s.IsTitleblockRevisionSchedule:
-                continue
+            by_lower[cat.Name.lower()] = cat
         except Exception:
             pass
-        if s.Name == schedule_name:
-            return s
-    return None
+    matched = []
+    unresolved = []
+    for n in names:
+        cat = by_lower.get(n.lower())
+        if cat is None:
+            unresolved.append(n)
+        else:
+            matched.append(cat)
+    return matched, unresolved
 
 
-def _find_param_id_on_schedule(target_schedule, parameter_name):
-    definition = target_schedule.Definition
-    for i in range(definition.GetFieldCount()):
-        field = definition.GetField(i)
-        if field.ColumnHeading == parameter_name:
-            return field.ParameterId
+def _collect_elements_by_categories(doc, categories):
+    """Union the instance-level elements across the given Category objects."""
+    all_elements = []
+    for cat in categories:
+        elements = FilteredElementCollector(doc).OfCategoryId(cat.Id) \
+            .WhereElementIsNotElementType().ToElements()
+        all_elements.extend(elements)
+    return all_elements
+
+
+def _find_param_id_on_elements(doc, elements, parameter_name):
+    """Look up the parameter on the first element (instance or type) that has it.
+    Mirrors Start.pushbutton's parameter-discovery approach."""
+    for el in elements:
+        for p in el.Parameters:
+            if p.Definition and p.Definition.Name == parameter_name:
+                return p.Id
+        try:
+            el_type = doc.GetElement(el.GetTypeId())
+            if el_type:
+                for p in el_type.Parameters:
+                    if p.Definition and p.Definition.Name == parameter_name:
+                        return p.Id
+        except Exception:
+            pass
     return None
 
 
@@ -197,10 +235,8 @@ def _gather_context(doc, el):
     return category_name, family_name, type_name
 
 
-def _build_audit_report(doc, target_schedule, target_param_id):
-    """Scan a schedule and produce the nested report + counts. Headless."""
-    elements = FilteredElementCollector(doc, target_schedule.Id).ToElements()
-
+def _build_audit_report(doc, elements, target_param_id):
+    """Scan a pre-collected element list and produce the nested report + counts."""
     report = {}
     cat_unique_filled = {}
     missing_count = 0
@@ -280,33 +316,46 @@ def _serialize_by_category(report):
 # Public headless API
 # ---------------------------------------------------------------------------
 
-def audit_data(doc, schedule_name, parameter_name):
+def audit_data(doc, category_name, parameter_name):
     if doc is None:
         return {"status": "error", "reason": "no_active_document",
                 "message": "No active Revit document."}
 
-    target_schedule = _find_schedule(doc, schedule_name)
-    if target_schedule is None:
-        return {"status": "error", "reason": "schedule_not_found",
-                "schedule": schedule_name,
-                "message": "ViewSchedule '{}' not found in active document.".format(schedule_name)}
+    names = _normalize_category_names(category_name)
+    if not names:
+        return {"status": "error", "reason": "category_not_found",
+                "message": "Missing category_name."}
 
-    target_param_id = _find_param_id_on_schedule(target_schedule, parameter_name)
+    categories, unresolved = _find_categories(doc, names)
+    if unresolved:
+        return {"status": "error", "reason": "category_not_found",
+                "category": unresolved,
+                "message": "Category not found: {}".format(", ".join(unresolved))}
+
+    elements = _collect_elements_by_categories(doc, categories)
+    if not elements:
+        return {"status": "error", "reason": "no_elements",
+                "category": names,
+                "message": "No elements found in category: {}".format(", ".join(names))}
+
+    target_param_id = _find_param_id_on_elements(doc, elements, parameter_name)
     if target_param_id is None:
         return {"status": "error", "reason": "parameter_not_found",
                 "parameter": parameter_name,
-                "message": "Parameter '{}' is not a field on schedule '{}'.".format(parameter_name, schedule_name)}
+                "message": "Parameter '{}' is not present on any element in category: {}.".format(
+                    parameter_name, ", ".join(names))}
 
-    audit = _build_audit_report(doc, target_schedule, target_param_id)
+    audit = _build_audit_report(doc, elements, target_param_id)
 
     if not audit["param_found_on_any"]:
         return {"status": "error", "reason": "parameter_not_found",
                 "parameter": parameter_name,
-                "message": "Parameter '{}' is not present on any element in schedule '{}'.".format(parameter_name, schedule_name)}
+                "message": "Parameter '{}' is not present on any element in category: {}.".format(
+                    parameter_name, ", ".join(names))}
 
     return {
         "status": "success",
-        "schedule": schedule_name,
+        "category": names,
         "parameter": parameter_name,
         "statistics": {
             "total_elements": audit["total_elements"],
@@ -338,8 +387,8 @@ def audit_data(doc, schedule_name, parameter_name):
 # ---------------------------------------------------------------------------
 
 
-def fill_snapshot(doc, schedule_name, parameter_name):
-    """Main-thread phase 1: resolve schedule/param and list rows needing fill.
+def fill_snapshot(doc, category_name, parameter_name):
+    """Main-thread phase 1: resolve category/param and list rows needing fill.
 
     Returns one of:
         {"status": "error", ...}
@@ -355,19 +404,30 @@ def fill_snapshot(doc, schedule_name, parameter_name):
         return {"status": "error", "reason": "no_active_document",
                 "message": "No active Revit document."}
 
-    target_schedule = _find_schedule(doc, schedule_name)
-    if target_schedule is None:
-        return {"status": "error", "reason": "schedule_not_found",
-                "schedule": schedule_name,
-                "message": "ViewSchedule '{}' not found.".format(schedule_name)}
+    names = _normalize_category_names(category_name)
+    if not names:
+        return {"status": "error", "reason": "category_not_found",
+                "message": "Missing category_name."}
 
-    target_param_id = _find_param_id_on_schedule(target_schedule, parameter_name)
+    categories, unresolved = _find_categories(doc, names)
+    if unresolved:
+        return {"status": "error", "reason": "category_not_found",
+                "category": unresolved,
+                "message": "Category not found: {}".format(", ".join(unresolved))}
+
+    elements = _collect_elements_by_categories(doc, categories)
+    if not elements:
+        return {"status": "error", "reason": "no_elements",
+                "category": names,
+                "message": "No elements found in category: {}".format(", ".join(names))}
+
+    target_param_id = _find_param_id_on_elements(doc, elements, parameter_name)
     if target_param_id is None:
         return {"status": "error", "reason": "parameter_not_found",
                 "parameter": parameter_name,
-                "message": "Parameter '{}' is not a field on schedule '{}'.".format(parameter_name, schedule_name)}
+                "message": "Parameter '{}' is not present on any element in category: {}.".format(
+                    parameter_name, ", ".join(names))}
 
-    elements = FilteredElementCollector(doc, target_schedule.Id).ToElements()
     total_elements = len(elements)
 
     rows = []
@@ -391,10 +451,10 @@ def fill_snapshot(doc, schedule_name, parameter_name):
         if current_val and current_val.strip() != "":
             continue
 
-        category_name, family_name, type_name = _gather_context(doc, el)
+        el_category, family_name, type_name = _gather_context(doc, el)
         rows.append({
             "el_id": el.Id,
-            "category": category_name,
+            "category": el_category,
             "family": family_name,
             "type": type_name,
         })
@@ -402,7 +462,8 @@ def fill_snapshot(doc, schedule_name, parameter_name):
     if not param_found_on_any:
         return {"status": "error", "reason": "parameter_not_found",
                 "parameter": parameter_name,
-                "message": "Parameter '{}' is not present on any element in schedule '{}'.".format(parameter_name, schedule_name)}
+                "message": "Parameter '{}' is not present on any element in category: {}.".format(
+                    parameter_name, ", ".join(names))}
 
     if not rows and read_only_seen and total_elements > 0:
         return {"status": "error", "reason": "parameter_read_only",
@@ -469,7 +530,7 @@ def fill_commit(doc, parameter_name, target_param_id, updates):
     return {"filled_ok": filled_ok}
 
 
-def fill_data(doc, schedule_name, parameter_name, api_key):
+def fill_data(doc, category_name, parameter_name, api_key):
     if doc is None:
         return {"status": "error", "reason": "no_active_document",
                 "message": "No active Revit document."}
@@ -479,19 +540,30 @@ def fill_data(doc, schedule_name, parameter_name, api_key):
         return {"status": "error", "reason": "api_key_missing",
                 "message": "No Anthropic API key supplied via request or user_config.ini"}
 
-    target_schedule = _find_schedule(doc, schedule_name)
-    if target_schedule is None:
-        return {"status": "error", "reason": "schedule_not_found",
-                "schedule": schedule_name,
-                "message": "ViewSchedule '{}' not found.".format(schedule_name)}
+    names = _normalize_category_names(category_name)
+    if not names:
+        return {"status": "error", "reason": "category_not_found",
+                "message": "Missing category_name."}
 
-    target_param_id = _find_param_id_on_schedule(target_schedule, parameter_name)
+    categories, unresolved = _find_categories(doc, names)
+    if unresolved:
+        return {"status": "error", "reason": "category_not_found",
+                "category": unresolved,
+                "message": "Category not found: {}".format(", ".join(unresolved))}
+
+    elements = _collect_elements_by_categories(doc, categories)
+    if not elements:
+        return {"status": "error", "reason": "no_elements",
+                "category": names,
+                "message": "No elements found in category: {}".format(", ".join(names))}
+
+    target_param_id = _find_param_id_on_elements(doc, elements, parameter_name)
     if target_param_id is None:
         return {"status": "error", "reason": "parameter_not_found",
                 "parameter": parameter_name,
-                "message": "Parameter '{}' is not a field on schedule '{}'.".format(parameter_name, schedule_name)}
+                "message": "Parameter '{}' is not present on any element in category: {}.".format(
+                    parameter_name, ", ".join(names))}
 
-    elements = FilteredElementCollector(doc, target_schedule.Id).ToElements()
     total_elements = len(elements)
 
     # Phase 1: predict (no transaction yet)
@@ -519,9 +591,9 @@ def fill_data(doc, schedule_name, parameter_name, api_key):
             continue
 
         initially_missing += 1
-        category_name, family_name, type_name = _gather_context(doc, el)
+        el_category, family_name, type_name = _gather_context(doc, el)
         predicted = _call_claude_predict(resolved_key, parameter_name,
-                                         category_name, family_name, type_name)
+                                         el_category, family_name, type_name)
         if predicted and not predicted.startswith("ERROR") and predicted != "UNKNOWN":
             updates_to_make.append((el.Id, predicted))
         else:
@@ -530,7 +602,8 @@ def fill_data(doc, schedule_name, parameter_name, api_key):
     if not param_found_on_any:
         return {"status": "error", "reason": "parameter_not_found",
                 "parameter": parameter_name,
-                "message": "Parameter '{}' is not present on any element in schedule '{}'.".format(parameter_name, schedule_name)}
+                "message": "Parameter '{}' is not present on any element in category: {}.".format(
+                    parameter_name, ", ".join(names))}
 
     if not updates_to_make and initially_missing == 0 and read_only_seen and total_elements > 0:
         return {"status": "error", "reason": "parameter_read_only",
@@ -569,7 +642,7 @@ def fill_data(doc, schedule_name, parameter_name, api_key):
     }
 
 
-def pipeline_post_audit(doc, schedule_name, parameter_name):
+def pipeline_post_audit(doc, category_name, parameter_name):
     """Main-thread helper for the split-phase start_pipeline.
 
     After fill_commit runs, the bridge needs the post-fill audit (so the AI
@@ -580,18 +653,26 @@ def pipeline_post_audit(doc, schedule_name, parameter_name):
     if doc is None:
         return {"status": "error", "reason": "no_active_document",
                 "message": "No active Revit document."}
-    target_schedule = _find_schedule(doc, schedule_name)
-    if target_schedule is None:
-        return {"status": "error", "reason": "schedule_not_found",
-                "schedule": schedule_name,
-                "message": "ViewSchedule '{}' not found.".format(schedule_name)}
-    target_param_id = _find_param_id_on_schedule(target_schedule, parameter_name)
+
+    names = _normalize_category_names(category_name)
+    if not names:
+        return {"status": "error", "reason": "category_not_found",
+                "message": "Missing category_name."}
+
+    categories, unresolved = _find_categories(doc, names)
+    if unresolved:
+        return {"status": "error", "reason": "category_not_found",
+                "category": unresolved,
+                "message": "Category not found: {}".format(", ".join(unresolved))}
+
+    elements = _collect_elements_by_categories(doc, categories)
+    target_param_id = _find_param_id_on_elements(doc, elements, parameter_name)
     if target_param_id is None:
         return {"status": "error", "reason": "parameter_not_found",
                 "parameter": parameter_name,
-                "message": "Parameter '{}' is not a field on schedule '{}'."
-                           .format(parameter_name, schedule_name)}
-    audit = _build_audit_report(doc, target_schedule, target_param_id)
+                "message": "Parameter '{}' is not present on any element in category: {}."
+                           .format(parameter_name, ", ".join(names))}
+    audit = _build_audit_report(doc, elements, target_param_id)
     return {"status": "ready", "audit": audit}
 
 
@@ -657,7 +738,7 @@ def pipeline_call_insights(api_key, system_prompt, user_prompt):
     return insights
 
 
-def start_pipeline(doc, schedule_name, parameter_name, api_key):
+def start_pipeline(doc, category_name, parameter_name, api_key):
     if doc is None:
         return {"status": "error", "reason": "no_active_document",
                 "message": "No active Revit document."}
@@ -667,13 +748,15 @@ def start_pipeline(doc, schedule_name, parameter_name, api_key):
         return {"status": "error", "reason": "api_key_missing",
                 "message": "No Anthropic API key supplied via request or user_config.ini"}
 
-    fill_result = fill_data(doc, schedule_name, parameter_name, resolved_key)
+    fill_result = fill_data(doc, category_name, parameter_name, resolved_key)
     if fill_result.get("status") != "success":
         return fill_result
 
-    target_schedule = _find_schedule(doc, schedule_name)
-    target_param_id = _find_param_id_on_schedule(target_schedule, parameter_name)
-    audit = _build_audit_report(doc, target_schedule, target_param_id)
+    names = _normalize_category_names(category_name)
+    categories, _unresolved = _find_categories(doc, names)
+    elements = _collect_elements_by_categories(doc, categories)
+    target_param_id = _find_param_id_on_elements(doc, elements, parameter_name)
+    audit = _build_audit_report(doc, elements, target_param_id)
 
     insights = []
     try:
