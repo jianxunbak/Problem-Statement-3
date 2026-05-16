@@ -1,0 +1,10 @@
+# Python / Cache
+__pycache__/
+*.pyc
+.env
+
+# Integration files
+integration_AgentA_port_discovery.md
+integration_AgentD.md
+integration_AgentD_autostart_spec.md
+integration_AgentD_bridge_spec.md
