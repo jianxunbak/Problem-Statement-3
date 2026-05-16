@@ -15,6 +15,7 @@ from Autodesk.Revit.DB import (
     ViewSchedule,
     ScheduleFieldType,
     BuiltInCategory,
+    BuiltInParameter,
     ElementId
 )
 
@@ -178,113 +179,13 @@ def create_audit_schedule(doc, uidoc, matched_categories, target_param_name):
         except:
             pass
     
-    multi_cat_id = ElementId.InvalidElementId  # creates a multi-category schedule
-    
+    # --- Transaction 1: Create the schedule ---
     t = Transaction(doc, "Create Data Agent Audit Schedule")
     t.Start()
     try:
-        schedule = ViewSchedule.CreateSchedule(doc, multi_cat_id)
+        schedule = ViewSchedule.CreateSchedule(doc, ElementId.InvalidElementId)
         schedule.Name = schedule_name
-        
-        definition = schedule.Definition
-        schedulable_fields = definition.GetSchedulableFields()
-        
-        # Map BuiltInParameter integer IDs to desired field labels
-        # These are the standard Revit BuiltInParameter enum values
-        BIP_CATEGORY   = -1013700   # ELEM_CATEGORY_PARAM
-        BIP_FAMILY     = -1002500   # ELEM_FAMILY_PARAM
-        BIP_TYPE       = -1002500   # fallback handled below
-        BIP_DESCRIPTION = -1002501  # ALL_MODEL_DESCRIPTION
-        
-        # Build lookups: by ParameterId (int) and by name
-        field_by_param_id = {}
-        field_by_name = {}
-        count_field = None
-        
-        for sf in schedulable_fields:
-            try:
-                ftype = sf.GetFieldType()
-                if ftype == ScheduleFieldType.Count:
-                    count_field = sf
-                    continue
-                param_id = sf.ParameterId.IntegerValue
-                field_by_param_id[param_id] = sf
-                name = sf.GetName(doc)
-                field_by_name[name] = sf
-            except:
-                pass
-        
-        # Log available fields for diagnostics
-        output.print_md("**Available schedulable fields ({}):**".format(len(field_by_name)))
-        for name in sorted(field_by_name.keys())[:30]:
-            sf = field_by_name[name]
-            output.print_md("- `{}` (ParamId: {})".format(name, sf.ParameterId.IntegerValue))
-        if len(field_by_name) > 30:
-            output.print_md("- ... and {} more".format(len(field_by_name) - 30))
-        output.print_md("- Count field found: **{}**".format(count_field is not None))
-        
-        # Helper: find a field by trying BuiltInParameter IDs first, then name strings
-        def find_field(param_ids, *names):
-            for pid in param_ids:
-                if pid in field_by_param_id:
-                    return field_by_param_id[pid]
-            for n in names:
-                if n in field_by_name:
-                    return field_by_name[n]
-                # Try case-insensitive match
-                for existing_name, sf in field_by_name.items():
-                    if existing_name.lower() == n.lower():
-                        return sf
-            return None
-        
-        # Add fields in order: Category, Family, Type, Count, Description
-        fields_added = []
-        
-        # Category: ELEM_CATEGORY_PARAM = -1013700
-        cat_f = find_field([-1013700], "Category")
-        if cat_f:
-            definition.AddField(cat_f)
-            fields_added.append("Category")
-        
-        # Family: ELEM_FAMILY_PARAM = -1002500, ALL_MODEL_FAMILY_NAME = -1002900
-        fam_f = find_field([-1002500, -1002900], "Family", "Family Name", "Family and Type")
-        if fam_f:
-            definition.AddField(fam_f)
-            fields_added.append("Family")
-        
-        # Type: ELEM_TYPE_PARAM = -1002502, ALL_MODEL_TYPE_NAME = -1002901
-        type_f = find_field([-1002502, -1002901], "Type", "Type Name")
-        if type_f:
-            definition.AddField(type_f)
-            fields_added.append("Type")
-        
-        # Count
-        if count_field:
-            definition.AddField(count_field)
-            fields_added.append("Count")
-        
-        # Description: ALL_MODEL_DESCRIPTION = -1002501
-        desc_f = find_field([-1002501], "Description")
-        if desc_f:
-            definition.AddField(desc_f)
-            fields_added.append("Description")
-        
-        # Also add the target audit parameter if not already one of the standard fields
-        standard_names = {"Category", "Family", "Family Name", "Type", "Type Name", "Count", "Description"}
-        if target_param_name not in standard_names:
-            target_f = find_field([], target_param_name)
-            if target_f:
-                definition.AddField(target_f)
-                fields_added.append(target_param_name)
-        
         t.Commit()
-        
-        # Open the schedule view
-        uidoc.ActiveView = schedule
-        output.print_md("📋 **Audit Schedule Created & Opened:** `{}`".format(schedule_name))
-        output.print_md("**Fields added:** {}".format(", ".join(fields_added) if fields_added else "⚠️ None matched"))
-        
-        return schedule
     except Exception as e:
         try:
             t.RollBack()
@@ -292,6 +193,87 @@ def create_audit_schedule(doc, uidoc, matched_categories, target_param_name):
             pass
         output.print_md("⚠️ **Error creating schedule:** {}".format(str(e)))
         return None
+    
+    # Open the schedule view first
+    uidoc.ActiveView = schedule
+    output.print_md("📋 **Audit Schedule Created & Opened:** `{}`".format(schedule_name))
+    
+    # --- Transaction 2: Add fields to the schedule ---
+    definition = schedule.Definition
+    schedulable_fields = definition.GetSchedulableFields()
+    field_count = schedulable_fields.Count
+    output.print_md("**Total schedulable fields available: {}**".format(field_count))
+    
+    # First pass: collect all field info (outside transaction)
+    all_fields = []  # list of (index, name, schedulable_field)
+    for i in range(field_count):
+        sf = schedulable_fields[i]
+        try:
+            name = sf.GetName(doc)
+        except Exception as e:
+            name = "__error__"
+            output.print_md("⚠️ Field {}: GetName failed: {}".format(i, str(e)))
+        all_fields.append((i, name, sf))
+    
+    # Log all discovered field names
+    output.print_md("**All field names:**")
+    for i, name, sf in all_fields:
+        output.print_md("- [{}] `{}`".format(i, name))
+    
+    # Define desired fields in order
+    desired_fields = ["Category", "Family", "Type", "Count", "Description"]
+    
+    # Build a mapping: desired_name -> schedulable_field
+    matched = {}
+    for desired in desired_fields:
+        for i, name, sf in all_fields:
+            if name == desired:
+                matched[desired] = sf
+                break
+    
+    # Log match results
+    output.print_md("**Match results:**")
+    for desired in desired_fields:
+        if desired in matched:
+            output.print_md("- ✅ `{}` — matched".format(desired))
+        else:
+            output.print_md("- ❌ `{}` — NOT found in schedulable fields".format(desired))
+    
+    # Add matched fields inside a transaction
+    t2 = Transaction(doc, "Add Fields to Audit Schedule")
+    t2.Start()
+    fields_added = []
+    try:
+        for desired in desired_fields:
+            if desired in matched:
+                sf = matched[desired]
+                try:
+                    definition.AddField(sf)
+                    fields_added.append(desired)
+                    output.print_md("  → Added `{}`".format(desired))
+                except Exception as e:
+                    output.print_md("  → FAILED to add `{}`: {}".format(desired, str(e)))
+        
+        # Also add the target audit parameter if not a standard field
+        if target_param_name not in set(desired_fields):
+            for i, name, sf in all_fields:
+                if name == target_param_name:
+                    try:
+                        definition.AddField(sf)
+                        fields_added.append(target_param_name)
+                        output.print_md("  → Added target param `{}`".format(target_param_name))
+                    except Exception as e:
+                        output.print_md("  → FAILED to add target `{}`: {}".format(target_param_name, str(e)))
+                    break
+        
+        t2.Commit()
+        output.print_md("**Fields added:** {}".format(", ".join(fields_added) if fields_added else "⚠️ None"))
+    except Exception as e:
+        try:
+            t2.RollBack()
+        except:
+            pass
+        output.print_md("⚠️ **Transaction error adding fields:** {}".format(str(e)))
 
 def main():
     uidoc = __revit__.ActiveUIDocument
