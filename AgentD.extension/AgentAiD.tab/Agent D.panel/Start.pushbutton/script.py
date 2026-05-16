@@ -9,9 +9,9 @@ import tempfile
 clr.AddReference('RevitAPI')
 from Autodesk.Revit.DB import (
     FilteredElementCollector,
-    ViewSchedule,
     StorageType,
-    Transaction
+    Transaction,
+    CategoryType
 )
 
 from pyrevit import script, forms
@@ -163,8 +163,8 @@ def main():
     
     # 1. Ask the user for their command
     user_command = forms.ask_for_string(
-        default="check the data",
-        prompt="Enter Agent Command:",
+        default="check walls",
+        prompt="Enter Agent Command (e.g. 'check walls', 'check walls and windows'):",
         title="Data Agent Chat"
     )
     
@@ -172,35 +172,84 @@ def main():
         script.exit()
         
     if "check" not in user_command.lower():
-        forms.alert("I am currently configured to handle data checking. Please type 'check the data' to begin.", title="Agent Response")
+        forms.alert(
+            "I am currently configured to handle data checking.\n"
+            "Please include 'check' followed by category names.\n"
+            "Example: 'check walls and windows'",
+            title="Agent Response"
+        )
         script.exit()
 
-    # 2. Select Schedule for scope
-    all_schedules = [s for s in FilteredElementCollector(doc).OfClass(ViewSchedule).ToElements() if not s.IsTitleblockRevisionSchedule]
-    all_schedules.sort(key=lambda s: s.Name)
+    # 2. Parse Revit categories from user command
+    all_model_categories = {}
+    for cat in doc.Settings.Categories:
+        try:
+            if cat.CategoryType == CategoryType.Model and cat.AllowsBoundParameters:
+                count = FilteredElementCollector(doc).OfCategoryId(cat.Id) \
+                    .WhereElementIsNotElementType().GetElementCount()
+                if count > 0:
+                    all_model_categories[cat.Name] = cat
+        except:
+            pass
     
-    target_schedule = forms.SelectFromList.show(
-        all_schedules,
-        name_attr='Name',
-        title="Select Schedule to act as the check scope",
-        button_name="Select"
-    )
+    command_lower = user_command.lower()
+    matched_categories = []
+    for cat_name in sorted(all_model_categories.keys()):
+        cat_lower = cat_name.lower()
+        # Direct substring, plural (+s / +es), or singular (-s) matching
+        if (cat_lower in command_lower
+                or (cat_lower + "s") in command_lower
+                or (cat_lower + "es") in command_lower
+                or (cat_lower.endswith("s") and cat_lower[:-1] in command_lower)):
+            matched_categories.append(all_model_categories[cat_name])
     
-    if not target_schedule:
-        script.exit()
-        
+    # If no categories matched, let the user pick manually
+    if not matched_categories:
+        selected_names = forms.SelectFromList.show(
+            sorted(all_model_categories.keys()),
+            title="No categories detected in command. Select categories to check:",
+            multiselect=True,
+            button_name="Check Selected"
+        )
+        if not selected_names:
+            script.exit()
+        matched_categories = [all_model_categories[n] for n in selected_names]
+    
+    cat_names_display = ", ".join([c.Name for c in matched_categories])
     output.print_md("## 🤖 Data Agent Check")
-    output.print_md("**Scope:** Schedule `{}`".format(target_schedule.Name))
+    output.print_md("**Scope:** Categories: `{}`".format(cat_names_display))
 
-    # 3. Get fields from the schedule to choose which parameter to check
-    definition = target_schedule.Definition
+    # 3. Collect all elements from the selected categories
+    all_elements = []
+    for cat in matched_categories:
+        elements = FilteredElementCollector(doc).OfCategoryId(cat.Id) \
+            .WhereElementIsNotElementType().ToElements()
+        all_elements.extend(elements)
+    
+    if not all_elements:
+        forms.alert("No elements found in the selected categories.", title="No Elements")
+        script.exit()
+
+    # 4. Discover parameters from the collected elements
     field_dict = {}
-    for i in range(definition.GetFieldCount()):
-        field = definition.GetField(i)
-        heading = field.ColumnHeading
-        if heading not in field_dict:
-            field_dict[heading] = field.ParameterId
-            
+    sample_count = min(100, len(all_elements))
+    for el in all_elements[:sample_count]:
+        for p in el.Parameters:
+            if p.Definition:
+                name = p.Definition.Name
+                if name not in field_dict:
+                    field_dict[name] = p.Id
+        try:
+            el_type = doc.GetElement(el.GetTypeId())
+            if el_type:
+                for p in el_type.Parameters:
+                    if p.Definition:
+                        name = p.Definition.Name
+                        if name not in field_dict:
+                            field_dict[name] = p.Id
+        except:
+            pass
+    
     target_param_name = forms.SelectFromList.show(
         sorted(field_dict.keys()),
         title="Which parameter should the Agent check?",
@@ -213,9 +262,6 @@ def main():
     target_param_id = field_dict[target_param_name]
     output.print_md("**Target Parameter:** `{}`".format(target_param_name))
     output.print_md("---")
-
-    # 4. Gather elements from the schedule
-    all_elements = FilteredElementCollector(doc, target_schedule.Id).ToElements()
     
     # 5. Extract unique Category and Family combinations
     cat_fam_options = set()
