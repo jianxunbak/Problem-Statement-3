@@ -50,7 +50,9 @@ def _autostart_bridge():
         bridge_dir = _find_bridge_dir(ext_root)
 
         if not bridge_dir:
-            _log("Bridge.pushbutton not found under {} — skipping autostart".format(ext_root))
+            # Bridge.pushbutton is not currently inside the extension (work in
+            # progress, parked outside, etc.). This is not an error — autostart
+            # has nothing to do. Stay silent so the pyRevit output isn't noisy.
             return
 
         if bridge_dir not in sys.path:

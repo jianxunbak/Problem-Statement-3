@@ -10,6 +10,13 @@ output. Errors are returned as structured dicts.
 import json
 import clr
 
+# IronPython 2.7 has `unicode` built-in. This shim keeps IDE static analyzers
+# (which assume Python 3) quiet without changing runtime behavior.
+try:
+    unicode  # type: ignore[name-defined]
+except NameError:  # pragma: no cover — only fires under a Py3 linter
+    unicode = str  # type: ignore[assignment,misc]
+
 clr.AddReference('RevitAPI')
 from Autodesk.Revit.DB import (
     FilteredElementCollector,
@@ -724,3 +731,268 @@ def start_pipeline(doc, schedule_name, parameter_name, api_key):
         "statistics": fill_result["statistics"],
         "ai_sanity_check_insights": insights,
     }
+
+
+# ---------------------------------------------------------------------------
+# HTML dashboard renderer (Agent A "fill description" flow opens this at end)
+#
+# Mirrors the look of the standalone Start.pushbutton dashboard but builds it
+# from the audit dict the bridge already has on hand, so we don't depend on
+# the original pushbutton script (which we promised not to edit).
+# ---------------------------------------------------------------------------
+
+_DASHBOARD_TEMPLATE = u"""<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Data Audit Dashboard</title>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;600;800&display=swap" rel="stylesheet">
+    <style>
+        :root {
+            --bg-color: #0f172a;
+            --card-bg: rgba(30, 41, 59, 0.7);
+            --text-main: #f8fafc;
+            --text-muted: #94a3b8;
+            --accent: #38bdf8;
+            --danger: #f43f5e;
+            --success: #10b981;
+        }
+        body {
+            margin: 0; padding: 2rem;
+            font-family: 'Inter', sans-serif;
+            background-color: var(--bg-color);
+            color: var(--text-main);
+            background-image: radial-gradient(circle at top right, #1e1b4b, #0f172a);
+            min-height: 100vh;
+        }
+        .header { text-align: center; margin-bottom: 2rem; }
+        .header h1 {
+            font-weight: 800; font-size: 2.5rem; margin: 0;
+            background: linear-gradient(to right, var(--accent), #818cf8);
+            -webkit-background-clip: text; -webkit-text-fill-color: transparent;
+        }
+        .stats-container {
+            display: flex; gap: 1.5rem; justify-content: center;
+            margin-bottom: 2rem; flex-wrap: wrap;
+        }
+        .stat-card {
+            background: var(--card-bg); backdrop-filter: blur(10px);
+            border: 1px solid rgba(255,255,255,0.1); border-radius: 1rem;
+            padding: 1.5rem 2.5rem; text-align: center; min-width: 150px;
+            box-shadow: 0 10px 15px -3px rgba(0,0,0,0.5);
+        }
+        .stat-card h3 { margin: 0 0 0.5rem 0; color: var(--text-muted); font-weight: 600; font-size: 1rem; }
+        .stat-card .value { font-size: 2.5rem; font-weight: 800; margin: 0; }
+        .stat-card.missing .value { color: var(--danger); }
+        .stat-card.filled  .value { color: var(--success); }
+        .stat-card.filled-now .value { color: var(--accent); }
+        .ai-card {
+            background: rgba(56,189,248,0.1);
+            border: 1px solid rgba(56,189,248,0.3);
+            border-radius: 1rem; padding: 1.5rem 2.5rem;
+            margin: 0 auto 2rem auto; max-width: 1200px;
+            box-shadow: 0 10px 15px -3px rgba(0,0,0,0.5);
+        }
+        .ai-card h3 { color: var(--accent); margin-top: 0; }
+        .ai-card ul { margin: 0 0 1rem 0; padding-left: 1.5rem; }
+        .ai-card li { margin-bottom: 0.5rem; }
+        .charts-grid {
+            display: grid; grid-template-columns: repeat(auto-fit, minmax(400px, 1fr));
+            gap: 2rem; max-width: 1200px; margin: 0 auto;
+        }
+        .chart-wrapper {
+            background: var(--card-bg); backdrop-filter: blur(10px);
+            border: 1px solid rgba(255,255,255,0.1); border-radius: 1rem;
+            padding: 1.5rem; box-shadow: 0 10px 15px -3px rgba(0,0,0,0.5);
+        }
+        canvas { width: 100% !important; height: 300px !important; }
+        .footer { text-align: center; color: var(--text-muted); margin-top: 2rem; font-size: 0.85rem; }
+    </style>
+</head>
+<body>
+    <div class="header">
+        <h1>Data Audit Dashboard</h1>
+        <p style="color: var(--text-muted)">Analysis of Target Parameter: <strong>__TARGET_PARAM__</strong></p>
+    </div>
+
+    <div class="stats-container">
+        <div class="stat-card missing"><h3>Missing Data</h3><p class="value">__MISSING_COUNT__</p></div>
+        <div class="stat-card filled"><h3>Filled Data</h3><p class="value">__FILLED_COUNT__</p></div>
+        <div class="stat-card filled-now"><h3>Filled This Run</h3><p class="value">__FILLED_NOW__</p></div>
+    </div>
+
+    __AI_INSIGHTS__
+
+    <div class="charts-grid">
+        <div class="chart-wrapper"><canvas id="overviewChart"></canvas></div>
+        <div class="chart-wrapper"><canvas id="categoryChart"></canvas></div>
+        <div class="chart-wrapper" style="grid-column: 1 / -1;"><canvas id="familyChart"></canvas></div>
+    </div>
+
+    <div class="footer">Generated by Agent D Bridge — __TIMESTAMP__</div>
+
+    <script>
+        Chart.defaults.color = '#94a3b8';
+        Chart.defaults.font.family = 'Inter';
+
+        new Chart(document.getElementById('overviewChart'), {
+            type: 'doughnut',
+            data: { labels: ['Missing','Filled'],
+                    datasets: [{ data: [__MISSING_COUNT__, __FILLED_COUNT__],
+                                 backgroundColor: ['#f43f5e','#10b981'],
+                                 borderWidth: 0, hoverOffset: 10 }] },
+            options: { responsive: true, maintainAspectRatio: false,
+                       plugins: { legend: { position: 'bottom' },
+                                  title: { display: true, text: 'Overall Completion',
+                                           color: '#f8fafc', font: {size: 16} } },
+                       cutout: '70%' }
+        });
+
+        new Chart(document.getElementById('categoryChart'), {
+            type: 'bar',
+            data: { labels: __CAT_LABELS__,
+                    datasets: [{ label: 'Missing', data: __CAT_MISSING__, backgroundColor: '#f43f5e', borderRadius: 4 },
+                               { label: 'Filled',  data: __CAT_FILLED__,  backgroundColor: '#10b981', borderRadius: 4 }] },
+            options: { responsive: true, maintainAspectRatio: false,
+                       plugins: { title: { display: true, text: 'Data by Category',
+                                           color: '#f8fafc', font: {size: 16} } },
+                       scales: { x: { stacked: true, grid: { color: 'rgba(255,255,255,0.05)' } },
+                                 y: { stacked: true, grid: { color: 'rgba(255,255,255,0.05)' } } } }
+        });
+
+        new Chart(document.getElementById('familyChart'), {
+            type: 'bar',
+            data: { labels: __FAM_LABELS__,
+                    datasets: [{ label: 'Missing', data: __FAM_MISSING__, backgroundColor: '#f43f5e', borderRadius: 4 },
+                               { label: 'Filled',  data: __FAM_FILLED__,  backgroundColor: '#10b981', borderRadius: 4 }] },
+            options: { responsive: true, maintainAspectRatio: false,
+                       plugins: { title: { display: true, text: 'Top Families (Most Missing Data)',
+                                           color: '#f8fafc', font: {size: 16} } },
+                       scales: { x: { stacked: true, grid: { color: 'rgba(255,255,255,0.05)' } },
+                                 y: { stacked: true, grid: { color: 'rgba(255,255,255,0.05)' } } } }
+        });
+    </script>
+</body>
+</html>
+"""
+
+
+def _aggregate_chart_data(audit_report):
+    """Return (cat_labels, cat_missing, cat_filled, fam_labels, fam_missing, fam_filled)."""
+    cat_data = {}
+    fam_data = {}
+    for cat, fams in audit_report.items():
+        if cat not in cat_data:
+            cat_data[cat] = {"missing": 0, "filled": 0}
+        for fam, types in fams.items():
+            if fam not in fam_data:
+                fam_data[fam] = {"missing": 0, "filled": 0}
+            for typ, bucket in types.items():
+                m = bucket["missing"]
+                f = bucket["filled"]
+                cat_data[cat]["missing"] += m
+                cat_data[cat]["filled"] += f
+                fam_data[fam]["missing"] += m
+                fam_data[fam]["filled"] += f
+
+    cat_labels = list(cat_data.keys())
+    cat_missing = [cat_data[k]["missing"] for k in cat_labels]
+    cat_filled = [cat_data[k]["filled"] for k in cat_labels]
+
+    sorted_fams = sorted(fam_data.items(), key=lambda x: x[1]["missing"], reverse=True)[:10]
+    fam_labels = [x[0] for x in sorted_fams]
+    fam_missing = [x[1]["missing"] for x in sorted_fams]
+    fam_filled = [x[1]["filled"] for x in sorted_fams]
+
+    return cat_labels, cat_missing, cat_filled, fam_labels, fam_missing, fam_filled
+
+
+def _insights_to_html(insights):
+    if not insights:
+        return u""
+    items = u"".join(u"<li>{}</li>".format(_html_escape(s)) for s in insights)
+    return (
+        u"<div class='ai-card'>"
+        u"<h3>\U0001f916 AI Sanity Check &amp; Next Steps</h3>"
+        u"<ul>{}</ul>"
+        u"</div>"
+    ).format(items)
+
+
+def _html_escape(s):
+    if s is None:
+        return u""
+    if not isinstance(s, unicode):  # noqa: F821 (IronPython 2.7)
+        try:
+            s = unicode(s)  # noqa: F821
+        except Exception:
+            s = str(s).decode("utf-8", "ignore")
+    return (s.replace(u"&", u"&amp;")
+             .replace(u"<", u"&lt;")
+             .replace(u">", u"&gt;"))
+
+
+def render_and_open_dashboard(audit, parameter_name, insights, filled_now):
+    """Write the dashboard HTML to %TEMP% and open it in the default browser.
+
+    Returns the path on success, or None on failure. Never raises — the
+    response to Agent A must not be broken if the browser open fails.
+
+    `audit` is the dict produced by _build_audit_report (post-fill audit, so
+    counts reflect the freshly-written values).
+    """
+    try:
+        import os
+        import io
+        import tempfile
+        import datetime
+
+        report = audit.get("report", {})
+        missing_count = audit.get("missing_count", 0)
+        filled_count = audit.get("filled_count", 0)
+
+        cat_labels, cat_missing, cat_filled, fam_labels, fam_missing, fam_filled = \
+            _aggregate_chart_data(report)
+
+        html = _DASHBOARD_TEMPLATE
+        html = html.replace(u"__TARGET_PARAM__", _html_escape(parameter_name))
+        html = html.replace(u"__MISSING_COUNT__", unicode(missing_count))  # noqa: F821
+        html = html.replace(u"__FILLED_COUNT__", unicode(filled_count))  # noqa: F821
+        html = html.replace(u"__FILLED_NOW__", unicode(filled_now))  # noqa: F821
+        html = html.replace(u"__CAT_LABELS__", _safe_json_dumps(cat_labels))
+        html = html.replace(u"__CAT_MISSING__", _safe_json_dumps(cat_missing))
+        html = html.replace(u"__CAT_FILLED__", _safe_json_dumps(cat_filled))
+        html = html.replace(u"__FAM_LABELS__", _safe_json_dumps(fam_labels))
+        html = html.replace(u"__FAM_MISSING__", _safe_json_dumps(fam_missing))
+        html = html.replace(u"__FAM_FILLED__", _safe_json_dumps(fam_filled))
+        html = html.replace(u"__AI_INSIGHTS__", _insights_to_html(insights))
+        html = html.replace(u"__TIMESTAMP__", _html_escape(
+            datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")))
+
+        temp_path = os.path.join(tempfile.gettempdir(), "DataAgentDashboard.html")
+        with io.open(temp_path, "w", encoding="utf-8") as f:
+            if isinstance(html, bytes):
+                html = html.decode("utf-8", "ignore")
+            f.write(html)
+
+        try:
+            os.startfile(temp_path)
+        except Exception:
+            # File written but couldn't launch — caller can still find it on disk.
+            pass
+
+        return temp_path
+    except Exception:
+        return None
+
+
+def _safe_json_dumps(value):
+    try:
+        return unicode(json.dumps(value, ensure_ascii=False))  # noqa: F821
+    except Exception:
+        try:
+            return unicode(json.dumps(value))  # noqa: F821
+        except Exception:
+            return u"[]"

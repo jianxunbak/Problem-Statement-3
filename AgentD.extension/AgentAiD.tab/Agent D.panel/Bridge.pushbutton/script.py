@@ -368,34 +368,48 @@ def _run_fill_streaming(sse, schedule_name, parameter_name, api_key, with_insigh
         "errors": errors,
     }
 
-    if not with_insights:
-        return {
-            "status": "success",
-            "target_parameter": parameter_name,
-            "statistics": statistics,
-        }
-
-    sse.status("Running AI sanity check…")
+    # Run a post-fill audit so we have fresh chart data for the dashboard.
+    # Needed for both fill_data and start_pipeline now that the dashboard
+    # opens at the end of either flow.
+    sse.status("Auditing post-fill state…")
     post = run_on_main_thread(agentd_headless.pipeline_post_audit,
                               (schedule_name, parameter_name))
-    if not post or post.get("status") != "ready":
-        # Surface a soft-fail: the fill succeeded, just no insights.
-        return {
-            "status": "success",
-            "target_parameter": parameter_name,
-            "statistics": statistics,
-            "ai_sanity_check_insights": ["AI sanity check unavailable: post-fill audit failed."],
-        }
-    system_prompt, user_prompt = agentd_headless.pipeline_build_insights_prompt(
-        parameter_name, post["audit"])
-    insights = agentd_headless.pipeline_call_insights(api_key, system_prompt, user_prompt)
+    post_audit = post.get("audit") if (post and post.get("status") == "ready") else None
 
-    return {
+    insights = []
+    if with_insights:
+        if post_audit is None:
+            insights = ["AI sanity check unavailable: post-fill audit failed."]
+        else:
+            sse.status("Running AI sanity check…")
+            system_prompt, user_prompt = agentd_headless.pipeline_build_insights_prompt(
+                parameter_name, post_audit)
+            insights = agentd_headless.pipeline_call_insights(api_key, system_prompt, user_prompt)
+
+    # Open the HTML dashboard in the user's default browser. Mirrors what the
+    # standalone Start.pushbutton does at the end of its run. Wrapped in
+    # try/except — a browser-launch failure must NOT break the response we
+    # send back to Agent A. Skipped if the post-fill audit failed.
+    dashboard_path = None
+    if post_audit is not None:
+        try:
+            sse.status("Opening dashboard…")
+            dashboard_path = agentd_headless.render_and_open_dashboard(
+                post_audit, parameter_name, insights,
+                filled_now=statistics.get("ai_filled_successfully", 0))
+        except Exception:
+            dashboard_path = None
+
+    result = {
         "status": "success",
         "target_parameter": parameter_name,
         "statistics": statistics,
-        "ai_sanity_check_insights": insights,
     }
+    if with_insights:
+        result["ai_sanity_check_insights"] = insights
+    if dashboard_path:
+        result["dashboard_path"] = dashboard_path
+    return result
 
 
 def _accept_loop(listener):
