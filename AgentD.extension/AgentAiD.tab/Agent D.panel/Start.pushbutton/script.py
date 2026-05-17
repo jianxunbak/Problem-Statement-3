@@ -8,6 +8,7 @@ import tempfile
 
 clr.AddReference('RevitAPI')
 from Autodesk.Revit.DB import (
+    Element,
     FilteredElementCollector,
     StorageType,
     Transaction,
@@ -55,12 +56,11 @@ def call_claude_insights(api_key, system_prompt, user_prompt):
     request.Headers.Add("anthropic-version", "2023-06-01")
     
     data = {
-        "model": "claude-haiku-4-5-20251001",
+        "model": "claude-opus-4-7",
         "max_tokens": 500,
         "system": system_prompt,
         "messages": [{"role": "user", "content": user_prompt}],
-        "temperature": 0.2
-    }
+            }
     
     json_data = json.dumps(data)
     bytes_data = System.Text.Encoding.UTF8.GetBytes(json_data)
@@ -93,16 +93,13 @@ def call_claude_insights(api_key, system_prompt, user_prompt):
         import traceback
         return "<div class='ai-card'><h3>⚠️ AI Error</h3><pre>" + traceback.format_exc() + "</pre></div>"
 
-def predict_missing_values_batch(api_key, target_param_name, unique_contexts):
-    """Predict values for multiple unique element types in a single API call.
-    
-    Args:
-        api_key: Anthropic API key
-        target_param_name: Name of the parameter to predict
-        unique_contexts: List of (category, family, type_name) tuples
+def _make_batch_api_call(api_key, target_param_name, unique_contexts, max_tokens):
+    """Make a single batch API call to predict missing values.
     
     Returns:
-        Dict mapping index (int) to predicted value (str), or {"error": msg} on failure.
+        On success: dict mapping index (int) to predicted value (str)
+        On truncation: {"truncated": True, "partial": dict_of_parsed_results}
+        On failure: {"error": error_message}
     """
     ServicePointManager.SecurityProtocol = SecurityProtocolType.Tls12
     url = "https://api.anthropic.com/v1/messages"
@@ -117,7 +114,7 @@ def predict_missing_values_batch(api_key, target_param_name, unique_contexts):
         "values for missing Revit parameters based on each element's Category, Family, and Type. "
         "You will receive a numbered list of elements. "
         "Respond ONLY with a valid JSON object mapping each number to its predicted value. "
-        'Example: {"0": "Concrete", "1": "Steel", "2": "Timber"}\n'
+        'Example: {"0": "12 inch Concrete Core Wall", "1": "Wall mounted Pipe Railing", "2": "Single Swing Door"}\n'
         "Do not add any conversational text, formatting, or markdown code blocks. "
         "Always make your best professional guess for a concise value (e.g., a descriptive name or standard code). "
         "NEVER use 'UNKNOWN' or say you cannot do it."
@@ -127,16 +124,11 @@ def predict_missing_values_batch(api_key, target_param_name, unique_contexts):
     for i, (cat, fam, typ) in enumerate(unique_contexts):
         user_prompt += "{}. Category: {} | Family: {} | Type: {}\n".format(i, cat, fam, typ)
     
-    # Scale max_tokens to the number of predictions needed, with a reasonable cap
-    max_tokens = max(100, len(unique_contexts) * 25)
-    max_tokens = min(max_tokens, 4096)
-    
     data = {
-        "model": "claude-haiku-4-5-20251001",
+        "model": "claude-opus-4-7",
         "max_tokens": max_tokens,
         "system": system_prompt,
         "messages": [{"role": "user", "content": user_prompt}],
-        "temperature": 0.0
     }
     
     json_data = json.dumps(data)
@@ -153,31 +145,147 @@ def predict_missing_values_batch(api_key, target_param_name, unique_contexts):
         reader.Close()
         response.Close()
         result = json.loads(response_text)
+        
+        # Check if the response was truncated due to max_tokens
+        stop_reason = result.get('stop_reason', '')
         text = result['content'][0]['text'].strip()
         # Clean up potential markdown code blocks from the response
         text = text.replace("```json", "").replace("```", "").strip()
+        
+        if stop_reason == 'max_tokens':
+            # Response was truncated - try to recover partial JSON
+            partial = _recover_partial_json(text)
+            return {"truncated": True, "partial": partial}
+        
         predictions = json.loads(text)
         return {int(k): v for k, v in predictions.items()}
     except Exception as e:
         return {"error": str(e)}
+
+
+def _recover_partial_json(text):
+    """Attempt to recover a valid dict from truncated JSON text.
+    
+    Tries progressively more aggressive truncation to find a parseable subset.
+    """
+    # Strategy 1: Find the last complete key-value pair by locating the last '",' or '"\n'
+    # and closing the object there
+    import re
+    # Find all complete "key": "value" pairs
+    pairs = re.findall(r'"(\d+)"\s*:\s*"([^"]*?)"', text)
+    if pairs:
+        return {int(k): v for k, v in pairs}
+    return {}
+
+
+def predict_missing_values_batch(api_key, target_param_name, unique_contexts):
+    """Predict values for multiple unique element types, with automatic retry on failure.
+    
+    Uses progressively smaller batch sizes if truncation or errors occur.
+    
+    Args:
+        api_key: Anthropic API key
+        target_param_name: Name of the parameter to predict
+        unique_contexts: List of (category, family, type_name) tuples
+    
+    Returns:
+        Dict mapping index (int) to predicted value (str), or {"error": msg} on failure.
+    """
+    # Scale max_tokens generously: ~60 tokens per prediction + buffer, capped at 8192
+    max_tokens = max(300, len(unique_contexts) * 60)
+    max_tokens = min(max_tokens, 8192)
+    
+    result = _make_batch_api_call(api_key, target_param_name, unique_contexts, max_tokens)
+    
+    # If successful, return directly
+    if isinstance(result, dict) and "error" not in result and "truncated" not in result:
+        return result
+    
+    # If truncated, collect whatever was recovered and retry the remaining items
+    if isinstance(result, dict) and result.get("truncated"):
+        recovered = result.get("partial", {})
+        output.print_md("⚠️ **Response truncated.** Recovered {} predictions, retrying remaining...".format(len(recovered)))
+        
+        # Find which indices were NOT recovered
+        missing_indices = [i for i in range(len(unique_contexts)) if i not in recovered]
+        
+        if missing_indices and len(missing_indices) < len(unique_contexts):
+            # Build a sub-batch of only the missing items
+            sub_contexts = [unique_contexts[i] for i in missing_indices]
+            sub_max_tokens = max(300, len(sub_contexts) * 80)  # more generous on retry
+            sub_max_tokens = min(sub_max_tokens, 8192)
+            sub_result = _make_batch_api_call(api_key, target_param_name, sub_contexts, sub_max_tokens)
+            
+            if isinstance(sub_result, dict) and "error" not in sub_result:
+                sub_data = sub_result.get("partial", sub_result) if sub_result.get("truncated") else sub_result
+                # Map sub-batch indices back to original indices
+                for sub_i, orig_i in enumerate(missing_indices):
+                    if sub_i in sub_data:
+                        recovered[orig_i] = sub_data[sub_i]
+        
+        if recovered:
+            return recovered
+    
+    # If error or complete failure, try splitting into two halves
+    if len(unique_contexts) > 1:
+        output.print_md("🔄 **Retrying with smaller batches (split in half)...**")
+        mid = len(unique_contexts) // 2
+        first_half = unique_contexts[:mid]
+        second_half = unique_contexts[mid:]
+        
+        combined = {}
+        
+        r1 = _make_batch_api_call(api_key, target_param_name, first_half, 
+                                   min(8192, max(300, len(first_half) * 80)))
+        if isinstance(r1, dict) and "error" not in r1:
+            data1 = r1.get("partial", r1) if r1.get("truncated") else r1
+            combined.update(data1)
+        
+        r2 = _make_batch_api_call(api_key, target_param_name, second_half,
+                                   min(8192, max(300, len(second_half) * 80)))
+        if isinstance(r2, dict) and "error" not in r2:
+            data2 = r2.get("partial", r2) if r2.get("truncated") else r2
+            # Remap second half indices: add mid offset
+            for k, v in data2.items():
+                combined[k + mid] = v
+        
+        if combined:
+            return combined
+    
+    # Final fallback: return the original error
+    if isinstance(result, dict) and "error" in result:
+        return result
+    return {"error": "All retry strategies failed"}
 
 def create_audit_schedule(doc, uidoc, matched_categories, target_param_name):
     """Create a multi-category audit schedule with standard fields and open it."""
     
     schedule_name = "Data Agent Audit - {}".format(target_param_name)
     
-    # Delete existing schedule with the same name
+    # Find existing schedule ID to delete (outside any transaction)
+    old_schedule_id = None
     existing = FilteredElementCollector(doc).OfClass(ViewSchedule).ToElements()
     for v in existing:
         try:
             if v.Name == schedule_name:
-                t_del = Transaction(doc, "Delete Old Audit Schedule")
-                t_del.Start()
-                doc.Delete(v.Id)
-                t_del.Commit()
+                old_schedule_id = v.Id
                 break
         except:
             pass
+    
+    # Delete old schedule if found
+    if old_schedule_id is not None:
+        t_del = Transaction(doc, "Delete Old Audit Schedule")
+        t_del.Start()
+        try:
+            doc.Delete(old_schedule_id)
+            t_del.Commit()
+        except Exception as e:
+            try:
+                t_del.RollBack()
+            except:
+                pass
+            output.print_md("⚠️ **Could not delete old schedule:** {}".format(str(e)))
     
     # --- Transaction 1: Create the schedule ---
     t = Transaction(doc, "Create Data Agent Audit Schedule")
@@ -395,7 +503,10 @@ def main():
         try:
             el_type = doc.GetElement(el.GetTypeId())
             if el_type:
-                family_name = getattr(el_type, "FamilyName", "Unknown Family")
+                try:
+                    family_name = el_type.FamilyName
+                except:
+                    family_name = "Unknown Family"
         except:
             pass
         cat_fam_options.add("{} - {}".format(category_name, family_name))
@@ -436,8 +547,14 @@ def main():
             try:
                 el_type = doc.GetElement(el.GetTypeId())
                 if el_type:
-                    type_name = getattr(el_type, "Name", "Unknown Type")
-                    family_name = getattr(el_type, "FamilyName", "Unknown Family")
+                    try:
+                        type_name = Element.Name.__get__(el_type)
+                    except:
+                        type_name = "Unknown Type"
+                    try:
+                        family_name = el_type.FamilyName
+                    except:
+                        family_name = "Unknown Family"
             except:
                 pass
                 
